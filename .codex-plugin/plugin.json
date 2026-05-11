@@ -1,0 +1,46 @@
+{
+  "name": "whatsapp-mcp",
+  "version": "0.1.0",
+  "description": "Codex plugin for a WhatsApp MCP server backed by the whatsapp-mcp bridge.",
+  "author": {
+    "name": "Timur Co",
+    "email": "",
+    "url": "https://github.com/timurco"
+  },
+  "homepage": "https://github.com/timurco/whatsapp-mcp",
+  "repository": "https://github.com/timurco/whatsapp-mcp",
+  "license": "MIT",
+  "keywords": [
+    "whatsapp",
+    "mcp",
+    "messaging"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "WhatsApp MCP",
+    "shortDescription": "Search, read, and send WhatsApp messages through MCP.",
+    "longDescription": "Connects Codex to a local WhatsApp MCP server. The bundled Go bridge authenticates with WhatsApp Web, stores messages locally in SQLite, and exposes message search, chat lookup, media download, and sending tools through the Python MCP server.",
+    "developerName": "Timur Co",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/timurco/whatsapp-mcp",
+    "privacyPolicyURL": "https://github.com/timurco/whatsapp-mcp",
+    "termsOfServiceURL": "https://github.com/timurco/whatsapp-mcp/blob/main/LICENSE",
+    "defaultPrompt": [
+      "Find my latest WhatsApp chat with Alex.",
+      "Search WhatsApp messages about the invoice.",
+      "Send a WhatsApp message to this contact."
+    ],
+    "brandColor": "#25D366",
+    "composerIcon": "./assets/whatsapp-mcp.svg",
+    "logo": "./assets/whatsapp-mcp.svg",
+    "screenshots": [
+      "./assets/example-use.png"
+    ]
+  }
+}

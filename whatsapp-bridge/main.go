@@ -36,6 +36,7 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"golang.org/x/crypto/hkdf"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Message represents a chat message for our client
@@ -92,6 +93,13 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE TABLE IF NOT EXISTS outgoing_raw (
+			id TEXT PRIMARY KEY,
+			chat_jid TEXT,
+			proto BLOB,
+			timestamp TIMESTAMP
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -138,6 +146,30 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
+}
+
+// Отправленное сообщение целиком, как ушло в whatsmeow. По нему отвечаем на
+// retry receipt: кэш whatsmeow ищет сообщение по паре (чат, id), а чат в
+// квитанции приходит LID-ом, хотя отправляли на номер. Пока связки LID-номер
+// в сессии нет, кэш промахивается, и собеседник видит пустой пузырь
+// «ожидание сообщения». Здесь ищем по одному id, и это переживает перезапуск.
+func (store *MessageStore) StoreOutgoingRaw(id, chatJID string, raw []byte, timestamp time.Time) error {
+	_, err := store.db.Exec(
+		"INSERT OR REPLACE INTO outgoing_raw (id, chat_jid, proto, timestamp) VALUES (?, ?, ?, ?)",
+		id, chatJID, raw, timestamp,
+	)
+	if err != nil {
+		return err
+	}
+	// Ретраи приходят в первые минуты-часы, месяц хранить незачем.
+	_, err = store.db.Exec("DELETE FROM outgoing_raw WHERE timestamp < ?", time.Now().Add(-14*24*time.Hour))
+	return err
+}
+
+func (store *MessageStore) GetOutgoingRaw(id string) ([]byte, error) {
+	var raw []byte
+	err := store.db.QueryRow("SELECT proto FROM outgoing_raw WHERE id = ?", id).Scan(&raw)
+	return raw, err
 }
 
 // Get messages from a chat
@@ -294,7 +326,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -462,13 +494,102 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
+	storeSentMessage(client, messageStore, recipientJID, msg, resp)
+
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// Сообщение, ушедшее через API, whatsmeow обратно событием не отдаёт - сами
+// себе мы не приходим. Без записи здесь в базе видны ответы собеседника, но
+// не наши реплики, и переписка читается с дырами.
+func storeSentMessage(client *whatsmeow.Client, messageStore *MessageStore, recipientJID types.JID, msg *waProto.Message, resp whatsmeow.SendResponse) {
+	ctx := context.Background()
+	logger := client.Log
+
+	timestamp := resp.Timestamp
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+
+	// Входящие от того же человека ложатся в чат с LID, а не с номером.
+	// Пишем туда же, иначе один разговор разъедется на два чата.
+	chatJID := recipientJID
+	if recipientJID.Server == types.DefaultUserServer {
+		if lid, err := client.Store.LIDs.GetLIDForPN(ctx, recipientJID); err == nil && !lid.IsEmpty() {
+			chatJID = lid
+		}
+	}
+	chat := chatJID.String()
+
+	sender := client.Store.ID.User
+	if chatJID.Server == types.HiddenUserServer && !client.Store.LID.IsEmpty() {
+		sender = client.Store.LID.User
+	}
+
+	if raw, err := proto.Marshal(msg); err != nil {
+		logger.Warnf("Failed to marshal sent message %s for retries: %v", resp.ID, err)
+	} else if err := messageStore.StoreOutgoingRaw(resp.ID, chat, raw, timestamp); err != nil {
+		logger.Warnf("Failed to store sent message %s for retries: %v", resp.ID, err)
+	}
+
+	name := GetChatName(client, messageStore, chatJID, chat, nil, "", logger)
+	if err := messageStore.StoreChat(chat, name, timestamp); err != nil {
+		logger.Warnf("Failed to store chat: %v", err)
+	}
+
+	content := extractTextContent(msg)
+	mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	if content == "" {
+		content = mediaCaption(msg)
+	}
+
+	err := messageStore.StoreMessage(resp.ID, chat, sender, content, timestamp, true,
+		mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+	if err != nil {
+		logger.Warnf("Failed to store sent message %s: %v", resp.ID, err)
+		return
+	}
+	fmt.Printf("[%s] → %s (%s): %s\n", timestamp.Format("2006-01-02 15:04:05"), sender, chat, content)
+}
+
+// Подпись к картинке, видео или документу. extractTextContent её не видит.
+func mediaCaption(msg *waProto.Message) string {
+	switch {
+	case msg.GetImageMessage() != nil:
+		return msg.GetImageMessage().GetCaption()
+	case msg.GetVideoMessage() != nil:
+		return msg.GetVideoMessage().GetCaption()
+	case msg.GetDocumentMessage() != nil:
+		return msg.GetDocumentMessage().GetCaption()
+	}
+	return ""
+}
+
+// Отвечаем на retry receipt сообщением из базы. whatsmeow зовёт это, когда
+// не нашёл сообщение в своём кэше.
+func messageForRetry(messageStore *MessageStore, logger waLog.Logger) func(requester, to types.JID, id types.MessageID) *waProto.Message {
+	return func(requester, to types.JID, id types.MessageID) *waProto.Message {
+		raw, err := messageStore.GetOutgoingRaw(id)
+		if err != nil {
+			if err != sql.ErrNoRows {
+				logger.Warnf("Failed to read sent message %s for retry: %v", id, err)
+			}
+			return nil
+		}
+		var msg waProto.Message
+		if err := proto.Unmarshal(raw, &msg); err != nil {
+			logger.Warnf("Failed to decode sent message %s for retry: %v", id, err)
+			return nil
+		}
+		logger.Infof("Resending %s to %s from the bridge store (retry receipt in %s)", id, requester, to)
+		return &msg
+	}
 }
 
 // Extract media info from a message
@@ -535,6 +656,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
+		// Молча пропущенное не отличить от непришедшего: реакция, правка,
+		// стикер выглядят в базе как тишина. Пишем в лог, что именно было.
+		logger.Infof("Skipped message %s in %s without text or media: %s", msg.Info.ID, chatJID, messageFields(msg.Message))
 		return
 	}
 
@@ -573,6 +697,22 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+}
+
+// Имена заполненных полей сообщения: reactionMessage, protocolMessage и т.п.
+func messageFields(msg *waProto.Message) string {
+	if msg == nil {
+		return "empty"
+	}
+	var names []string
+	msg.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		names = append(names, string(fd.Name()))
+		return true
+	})
+	if len(names) == 0 {
+		return "empty"
+	}
+	return strings.Join(names, ",")
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -896,7 +1036,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1023,6 +1163,8 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+
+	client.GetMessageForRetry = messageForRetry(messageStore, logger)
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {

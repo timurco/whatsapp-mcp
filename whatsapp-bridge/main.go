@@ -1203,6 +1203,9 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				// Under launchd stdout is a log file, where the half-block QR is hard to scan:
+				// the raw code lets a helper render it as an image (qr-page.py).
+				fmt.Println("QR-CODE: " + evt.Code)
 			} else if evt.Event == "success" {
 				connected <- true
 				break

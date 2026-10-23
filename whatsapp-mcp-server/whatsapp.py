@@ -107,13 +107,19 @@ class Message:
     reply_to: Optional[str] = None
     reply_sender: Optional[str] = None
     mentions: Optional[List[str]] = None
+    edited: bool = False
+    revoked: bool = False
+    # Автор реакции и сам эмодзи. Реакции лежат своей таблицей, поэтому
+    # приезжают отдельным запросом, а не колонкой.
+    reactions: Optional[List[Tuple[str, str]]] = None
 
 # Колонки, которыми читаются сообщения: один список на все запросы, чтобы
 # индексы в разборе строки не разъезжались с SELECT.
 MESSAGE_COLUMNS = (
     "messages.timestamp, messages.sender, chats.name, messages.content, "
     "messages.is_from_me, chats.jid, messages.id, messages.media_type, "
-    "messages.reply_to, messages.reply_sender, messages.mentions"
+    "messages.reply_to, messages.reply_sender, messages.mentions, "
+    "messages.edited_at, messages.revoked_at"
 )
 
 
@@ -142,7 +148,39 @@ def message_from_row(row) -> "Message":
         reply_to=row[8],
         reply_sender=row[9],
         mentions=mentions_from_row(row[10]),
+        edited=bool(row[11]),
+        revoked=bool(row[12]),
     )
+
+
+def attach_reactions(conn: sqlite3.Connection, messages: List[Message]) -> None:
+    """Реакции ко всему списку одним запросом: по запросу на сообщение
+    вышло бы двадцать запросов на каждый список."""
+    message_ids = sorted({message.id for message in messages if message.id})
+    if not message_ids:
+        return
+
+    placeholders = ','.join('?' * len(message_ids))
+    try:
+        rows = conn.execute(
+            f"SELECT message_id, chat_jid, sender, emoji FROM reactions "
+            f"WHERE message_id IN ({placeholders})",
+            tuple(message_ids),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # База, в которую писал мост постарше: таблицы реакций в ней нет,
+        # и это не повод уронить чтение сообщений.
+        return
+
+    # Один номер сообщения встречается в разных чатах, поэтому ключ - пара.
+    by_message = {}
+    for message_id, chat_jid, sender, emoji in rows:
+        by_message.setdefault((message_id, chat_jid), []).append((sender, emoji))
+
+    for message in messages:
+        reactions = by_message.get((message.id, message.chat_jid))
+        if reactions:
+            message.reactions = reactions
 
 
 @dataclass
@@ -260,7 +298,26 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
             mentioned = ", ".join(get_sender_name(jid) for jid in message.mentions)
             mentions_suffix = f" [Mentions: {mentioned}]"
 
-        output += f"From: {sender_name}: {reply_prefix}{content_prefix}{message.content}{mentions_suffix}\n"
+        # Поправленный текст лежит на месте прежнего, и без пометки его
+        # не отличить от написанного сразу. Удалённое у всех мы храним,
+        # но в чате его больше нет, и об этом надо сказать.
+        state_prefix = ""
+        if message.revoked:
+            state_prefix = "[deleted by sender] "
+        elif message.edited:
+            state_prefix = "[edited] "
+
+        reactions_suffix = ""
+        if message.reactions:
+            reacted = ", ".join(
+                f"{emoji} {get_sender_name(sender)}" for sender, emoji in message.reactions
+            )
+            reactions_suffix = f" [Reactions: {reacted}]"
+
+        output += (
+            f"From: {sender_name}: {state_prefix}{reply_prefix}{content_prefix}"
+            f"{message.content}{mentions_suffix}{reactions_suffix}\n"
+        )
     except Exception as e:
         print(f"Error formatting message: {e}", file=sys.stderr)
     return output
@@ -355,7 +412,9 @@ def list_messages(
         result = []
         for msg in messages:
             result.append(message_from_row(msg))
-            
+
+        attach_reactions(conn, result)
+
         if include_context and result:
             # Add context for each message
             messages_with_context = []
@@ -425,7 +484,9 @@ def get_message_context(
         """, (msg_data[5], msg_data[0], after))
         
         after_messages = [message_from_row(msg) for msg in cursor.fetchall()]
-        
+
+        attach_reactions(conn, [target_message] + before_messages + after_messages)
+
         return MessageContext(
             message=target_message,
             before=before_messages,

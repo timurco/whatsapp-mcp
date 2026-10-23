@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +31,9 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	// Старый псевдоним binary/proto отстал от протокола и части постоянных
+	// в нём нет вовсе: тип запечатанного конверта берём из waE2E напрямую.
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -61,8 +65,15 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
+	return NewMessageStoreAt("store/messages.db")
+}
+
+// NewMessageStoreAt - то же, но с явным путём к базе. Нужен, чтобы схему
+// и запросы можно было проверить тестом на своей временной базе, а не
+// на той, в которую пишет живой мост.
+func NewMessageStoreAt(path string) (*MessageStore, error) {
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:"+path+"?_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -93,8 +104,24 @@ func NewMessageStore() (*MessageStore, error) {
 			reply_to TEXT,
 			reply_sender TEXT,
 			mentions TEXT,
+			edited_at TIMESTAMP,
+			revoked_at TIMESTAMP,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+
+		-- Реакция лежит отдельной строкой, а не сообщением: иначе «❤️» встало
+		-- бы в ленту между репликами. Ключ - сообщение, чат и автор реакции:
+		-- одна реакция на человека, новая заменяет прежнюю, снятая удаляется.
+		-- Связи с messages нет нарочно: реакцию ставят и на сообщение, которое
+		-- старше нашей базы, и внешний ключ отбросил бы её вовсе.
+		CREATE TABLE IF NOT EXISTS reactions (
+			message_id TEXT,
+			chat_jid TEXT,
+			sender TEXT,
+			emoji TEXT,
+			timestamp TIMESTAMP,
+			PRIMARY KEY (message_id, chat_jid, sender)
 		);
 
 		CREATE TABLE IF NOT EXISTS outgoing_raw (
@@ -112,12 +139,15 @@ func NewMessageStore() (*MessageStore, error) {
 	// Старая база заведена без этих колонок, и CREATE TABLE IF NOT EXISTS её
 	// не меняет. Добавляем на месте: без direct_path скачивание строит ссылку
 	// из url и теряет подпись CDN, без reply_to и mentions ответ в группе
-	// неотличим от новой реплики.
+	// неотличим от новой реплики, без edited_at и revoked_at поправленный
+	// текст не отличить от написанного сразу.
 	for _, column := range []string{
 		"direct_path TEXT",
 		"reply_to TEXT",
 		"reply_sender TEXT",
 		"mentions TEXT",
+		"edited_at TIMESTAMP",
+		"revoked_at TIMESTAMP",
 	} {
 		if _, err := db.Exec("ALTER TABLE messages ADD COLUMN " + column); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {
@@ -191,6 +221,78 @@ func (store *MessageStore) StoreMessage(rec MessageRecord) error {
 		rec.ReplyTo, rec.ReplySender, mentions,
 	)
 	return err
+}
+
+// StoreReaction - реакция человека на сообщение. Прежняя реакция того же
+// человека заменяется: в WhatsApp она одна на сообщение.
+func (store *MessageStore) StoreReaction(messageID, chatJID, sender, emoji string, timestamp time.Time) error {
+	_, err := store.db.Exec(
+		`INSERT OR REPLACE INTO reactions (message_id, chat_jid, sender, emoji, timestamp)
+		VALUES (?, ?, ?, ?, ?)`,
+		messageID, chatJID, sender, emoji, timestamp,
+	)
+	return err
+}
+
+// RemoveReaction - снятая реакция. WhatsApp отменяет её тем же сообщением
+// с пустым текстом, поэтому строку удаляем, а не храним пустую.
+func (store *MessageStore) RemoveReaction(messageID, chatJID, sender string) error {
+	_, err := store.db.Exec(
+		"DELETE FROM reactions WHERE message_id = ? AND chat_jid = ? AND sender = ?",
+		messageID, chatJID, sender,
+	)
+	return err
+}
+
+// Reactions - реакции к одному сообщению, автор к эмодзи.
+func (store *MessageStore) Reactions(messageID, chatJID string) (map[string]string, error) {
+	rows, err := store.db.Query(
+		"SELECT sender, emoji FROM reactions WHERE message_id = ? AND chat_jid = ?",
+		messageID, chatJID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	reactions := make(map[string]string)
+	for rows.Next() {
+		var sender, emoji string
+		if err := rows.Scan(&sender, &emoji); err != nil {
+			return nil, err
+		}
+		reactions[sender] = emoji
+	}
+	return reactions, rows.Err()
+}
+
+// ApplyEdit - поправленный текст вместо прежнего. Возвращает false, если
+// правленого сообщения у нас нет: оно старше базы, и тогда правка не теряется
+// молча, а попадает в лог.
+func (store *MessageStore) ApplyEdit(messageID, chatJID, content string, editedAt time.Time) (bool, error) {
+	res, err := store.db.Exec(
+		"UPDATE messages SET content = ?, edited_at = ? WHERE id = ? AND chat_jid = ?",
+		content, editedAt, messageID, chatJID,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	return affected > 0, err
+}
+
+// MarkRevoked - «удалить у всех». Текст остаётся лежать: у нас он уже есть,
+// и знать, что именно убрали, полезнее, чем пустая строка.
+func (store *MessageStore) MarkRevoked(messageID, chatJID string, revokedAt time.Time) (bool, error) {
+	res, err := store.db.Exec(
+		"UPDATE messages SET revoked_at = ? WHERE id = ? AND chat_jid = ?",
+		revokedAt, messageID, chatJID,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	return affected > 0, err
 }
 
 // Отправленное сообщение целиком, как ушло в whatsmeow. По нему отвечаем на
@@ -267,6 +369,7 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return ""
 	}
@@ -278,14 +381,153 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Подпись к файлу: раньше её не читал никто, и все 1906 картинок,
+	// видео и документов лежали в базе с пустым content - сказанное вместе
+	// с файлом пропадало целиком.
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+
+	// Нетекстовое: короткая пометка в скобках. Без неё такое сообщение
+	// пропадало вовсе - запись в чате не появлялась, хотя время последнего
+	// сообщения в чате обновлялось, и чат выглядел живым и пустым.
+	if loc := msg.GetLocationMessage(); loc != nil {
+		return describeLocation("location", loc.GetName(), loc.GetAddress(),
+			loc.GetDegreesLatitude(), loc.GetDegreesLongitude())
+	}
+	if live := msg.GetLiveLocationMessage(); live != nil {
+		return describeLocation("live location", live.GetCaption(), "",
+			live.GetDegreesLatitude(), live.GetDegreesLongitude())
+	}
+	if contact := msg.GetContactMessage(); contact != nil {
+		return bracket("contact", contact.GetDisplayName())
+	}
+	if contacts := msg.GetContactsArrayMessage(); contacts != nil {
+		names := make([]string, 0, len(contacts.GetContacts()))
+		for _, contact := range contacts.GetContacts() {
+			if name := contact.GetDisplayName(); name != "" {
+				names = append(names, name)
+			}
+		}
+		return bracket("contacts", strings.Join(names, ", "))
+	}
+	if poll := pollCreation(msg); poll != nil {
+		options := make([]string, 0, len(poll.GetOptions()))
+		for _, option := range poll.GetOptions() {
+			options = append(options, option.GetOptionName())
+		}
+		text := poll.GetName()
+		if len(options) > 0 {
+			text += " options: " + strings.Join(options, ", ")
+		}
+		return bracket("poll", text)
+	}
+	if msg.GetPollUpdateMessage() != nil {
+		// Голос едет зашифрованным и к тому же хешами вариантов, а не их
+		// названиями: показываем сам факт голосования.
+		return "[poll vote]"
+	}
+	if added := msg.GetPollAddOptionMessage(); added != nil {
+		return bracket("poll option added", added.GetAddOption().GetOptionName())
+	}
+
+	// Стикер и прочее с файлом внутри доходит сюда без текста, и это верно:
+	// содержимое у них в media_type, а не в строке.
 	return ""
+}
+
+// bracket - пометка вида [poll: Обед или ужин] и просто [contact], когда
+// называть нечего.
+func bracket(label, text string) string {
+	if strings.TrimSpace(text) == "" {
+		return "[" + label + "]"
+	}
+	return "[" + label + ": " + strings.TrimSpace(text) + "]"
+}
+
+// describeLocation - место точкой на карте: что подписано и координаты.
+func describeLocation(label, name, address string, latitude, longitude float64) string {
+	parts := make([]string, 0, 2)
+	if name != "" {
+		parts = append(parts, name)
+	}
+	if address != "" && address != name {
+		parts = append(parts, address)
+	}
+	coords := strconv.FormatFloat(latitude, 'f', -1, 64) + ", " + strconv.FormatFloat(longitude, 'f', -1, 64)
+	parts = append(parts, "("+coords+")")
+	return bracket(label, strings.Join(parts, " "))
+}
+
+// unwrapMessage раскрывает обёртки, внутри которых лежит настоящее
+// сообщение: одноразовое фото, исчезающее сообщение, документ с подписью,
+// упоминание всей группы. Документ с подписью приходит именно так, и без
+// этого терялся целиком - ни файла, ни сказанного рядом.
+func unwrapMessage(msg *waProto.Message) *waProto.Message {
+	// Предел на случай обёртки, ссылающейся на себя: пришло такое - лучше
+	// отдать внешнее сообщение, чем крутиться здесь.
+	for depth := 0; msg != nil && depth < 5; depth++ {
+		var inner *waProto.Message
+		switch {
+		case msg.GetViewOnceMessage() != nil:
+			inner = msg.GetViewOnceMessage().GetMessage()
+		case msg.GetViewOnceMessageV2() != nil:
+			inner = msg.GetViewOnceMessageV2().GetMessage()
+		case msg.GetViewOnceMessageV2Extension() != nil:
+			inner = msg.GetViewOnceMessageV2Extension().GetMessage()
+		case msg.GetEphemeralMessage() != nil:
+			inner = msg.GetEphemeralMessage().GetMessage()
+		case msg.GetDocumentWithCaptionMessage() != nil:
+			inner = msg.GetDocumentWithCaptionMessage().GetMessage()
+		case msg.GetGroupMentionedMessage() != nil:
+			inner = msg.GetGroupMentionedMessage().GetMessage()
+		}
+		if inner == nil {
+			return msg
+		}
+		msg = inner
+	}
+	return msg
+}
+
+// pollCreation - опрос, в какой бы версии поля он ни пришёл. Опросы переехали
+// с pollCreationMessage на V2..V6, и код, знавший только первую версию, не
+// видел ни одного современного опроса. V4 к тому же завёрнут в futureProof.
+func pollCreation(msg *waProto.Message) *waProto.PollCreationMessage {
+	if msg == nil {
+		return nil
+	}
+	for _, poll := range []*waProto.PollCreationMessage{
+		msg.GetPollCreationMessage(),
+		msg.GetPollCreationMessageV2(),
+		msg.GetPollCreationMessageV3(),
+		msg.GetPollCreationMessageV5(),
+		msg.GetPollCreationMessageV6(),
+	} {
+		if poll != nil {
+			return poll
+		}
+	}
+	if wrapped := msg.GetPollCreationMessageV4(); wrapped != nil {
+		return pollCreation(wrapped.GetMessage())
+	}
+	return nil
 }
 
 // messageContextInfo - ContextInfo сообщения: в нём лежат и цитата, и
 // упоминания. Своё поле contextInfo есть у каждого типа вложения, поэтому
 // ищем его отражением, а не перебором двенадцати геттеров.
 func messageContextInfo(msg *waProto.Message) *waProto.ContextInfo {
+	// Ответ одноразовым фото или документом с подписью лежит в обёртке,
+	// и цитата внутри неё: без раскрытия такой ответ читался бы как
+	// новая реплика.
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return nil
 	}
@@ -633,9 +875,6 @@ func storeSentMessage(client *whatsmeow.Client, messageStore *MessageStore, reci
 
 	content := extractTextContent(msg)
 	mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
-	if content == "" {
-		content = mediaCaption(msg)
-	}
 
 	replyTo, replySender, mentions := replyAndMentions(msg)
 	err := messageStore.StoreMessage(MessageRecord{
@@ -664,19 +903,6 @@ func storeSentMessage(client *whatsmeow.Client, messageStore *MessageStore, reci
 	fmt.Printf("[%s] → %s (%s): %s\n", timestamp.Format("2006-01-02 15:04:05"), sender, chat, content)
 }
 
-// Подпись к картинке, видео или документу. extractTextContent её не видит.
-func mediaCaption(msg *waProto.Message) string {
-	switch {
-	case msg.GetImageMessage() != nil:
-		return msg.GetImageMessage().GetCaption()
-	case msg.GetVideoMessage() != nil:
-		return msg.GetVideoMessage().GetCaption()
-	case msg.GetDocumentMessage() != nil:
-		return msg.GetDocumentMessage().GetCaption()
-	}
-	return ""
-}
-
 // Отвечаем на retry receipt сообщением из базы. whatsmeow зовёт это, когда
 // не нашёл сообщение в своём кэше.
 func messageForRetry(messageStore *MessageStore, logger waLog.Logger) func(requester, to types.JID, id types.MessageID) *waProto.Message {
@@ -700,6 +926,7 @@ func messageForRetry(messageStore *MessageStore, logger waLog.Logger) func(reque
 
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, directPath string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return "", "", "", "", nil, nil, nil, 0
 	}
@@ -736,6 +963,12 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 			doc.GetURL(), doc.GetDirectPath(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
 	}
 
+	// Стикер - такой же файл на CDN, скачивается ключами картинки.
+	if sticker := msg.GetStickerMessage(); sticker != nil {
+		return "sticker", "sticker_" + time.Now().Format("20060102_150405") + ".webp",
+			sticker.GetURL(), sticker.GetDirectPath(), sticker.GetMediaKey(), sticker.GetFileSHA256(), sticker.GetFileEncSHA256(), sticker.GetFileLength()
+	}
+
 	return "", "", "", "", nil, nil, nil, 0
 }
 
@@ -752,6 +985,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
+	}
+
+	// Реакция, правка и «удалить у всех» - не новые сообщения, а изменения
+	// уже лежащих. Они правят свою строку и общим путём дальше не идут.
+	if applyMessageUpdate(client, messageStore, msg, chatJID, sender, logger) {
+		return
 	}
 
 	// Extract text content
@@ -808,6 +1047,161 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+}
+
+// applyMessageUpdate - события, меняющие уже сохранённое сообщение: реакция,
+// снятая реакция, правка текста, «удалить у всех». Возвращает true, если
+// сообщение было таким событием: новой строки в ленте ему не нужно.
+func applyMessageUpdate(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, chatJID, sender string, logger waLog.Logger) bool {
+	ctx := context.Background()
+	stamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
+
+	// В личке реакция приходит открытым текстом, в группе - запечатанной
+	// тем же секретом, которым зашифровано само сообщение.
+	reaction := msg.Message.GetReactionMessage()
+	if reaction == nil && msg.Message.GetEncReactionMessage() != nil {
+		decrypted, err := client.DecryptReaction(ctx, msg)
+		if err != nil {
+			logger.Warnf("Failed to decrypt reaction %s in %s: %v", msg.Info.ID, chatJID, err)
+			return true
+		}
+		reaction = decrypted
+	}
+	if reaction != nil {
+		target := reaction.GetKey().GetID()
+		if target == "" {
+			logger.Warnf("Reaction %s in %s came without a target message", msg.Info.ID, chatJID)
+			return true
+		}
+		// Пустой текст - это снятие реакции: другого сигнала WhatsApp
+		// для отмены не присылает.
+		if emoji := reaction.GetText(); emoji == "" {
+			if err := messageStore.RemoveReaction(target, chatJID, sender); err != nil {
+				logger.Warnf("Failed to remove reaction of %s on %s in %s: %v", sender, target, chatJID, err)
+				return true
+			}
+			fmt.Printf("[%s] %s took back a reaction on %s (%s)\n", stamp, sender, target, chatJID)
+			return true
+		} else if err := messageStore.StoreReaction(target, chatJID, sender, emoji, msg.Info.Timestamp); err != nil {
+			logger.Warnf("Failed to store reaction of %s on %s in %s: %v", sender, target, chatJID, err)
+		} else {
+			fmt.Printf("[%s] %s reacted %s to %s (%s)\n", stamp, sender, emoji, target, chatJID)
+		}
+		return true
+	}
+
+	// Правка едет не текстом, а отдельным запечатанным конвертом, и цель
+	// в нём - targetMessageKey: номер самого события указывает на правку,
+	// а не на поправленное сообщение.
+	if enc := msg.Message.GetSecretEncryptedMessage(); enc != nil &&
+		enc.GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
+		target := enc.GetTargetMessageKey().GetID()
+		edited, err := client.DecryptSecretEncryptedMessage(ctx, msg)
+		if err != nil {
+			logger.Warnf("Failed to decrypt the edit of %s in %s: %v", target, chatJID, err)
+			return true
+		}
+		storeEdit(messageStore, target, chatJID, edited, msg.Info.Timestamp, logger)
+		return true
+	}
+
+	// Тот же путь у старых клиентов: правка и удаление открытым
+	// протокольным сообщением.
+	if target, edited, ok := editFromProtocol(msg.Message); ok {
+		storeEdit(messageStore, target, chatJID, edited, msg.Info.Timestamp, logger)
+		return true
+	}
+	if target, ok := revokeFromProtocol(msg.Message); ok {
+		found, err := messageStore.MarkRevoked(target, chatJID, msg.Info.Timestamp)
+		switch {
+		case err != nil:
+			logger.Warnf("Failed to mark %s in %s as deleted: %v", target, chatJID, err)
+		case !found:
+			logger.Infof("Deleted message %s in %s was never stored", target, chatJID)
+		default:
+			fmt.Printf("[%s] %s deleted %s (%s)\n", stamp, sender, target, chatJID)
+		}
+		return true
+	}
+
+	return false
+}
+
+// storeEdit - поправленный текст вместо прежнего.
+func storeEdit(messageStore *MessageStore, target, chatJID string, edited *waProto.Message, editedAt time.Time, logger waLog.Logger) {
+	if target == "" {
+		logger.Warnf("An edit in %s came without a target message", chatJID)
+		return
+	}
+	content := editedContent(edited)
+	if content == "" {
+		logger.Warnf("The edit of %s in %s came without text: %s", target, chatJID, messageFields(edited))
+		return
+	}
+	found, err := messageStore.ApplyEdit(target, chatJID, content, editedAt)
+	switch {
+	case err != nil:
+		logger.Warnf("Failed to apply the edit of %s in %s: %v", target, chatJID, err)
+	case !found:
+		logger.Infof("Edited message %s in %s was never stored", target, chatJID)
+	default:
+		fmt.Printf("[%s] edit of %s (%s): %s\n", editedAt.Format("2006-01-02 15:04:05"), target, chatJID, content)
+	}
+}
+
+// editedContent - новый текст правки. Расшифрованный конверт приходит то
+// целым сообщением, то протокольным, то обёрнутым в editedMessage.
+func editedContent(msg *waProto.Message) string {
+	if msg == nil {
+		return ""
+	}
+	if content := extractTextContent(msg); content != "" {
+		return content
+	}
+	if _, edited, ok := editFromProtocol(msg); ok {
+		return extractTextContent(edited)
+	}
+	return extractTextContent(msg.GetEditedMessage().GetMessage())
+}
+
+// protocolOf - протокольное сообщение названного типа. Проверка на
+// незаполненный тип тут не формальность: нулевое значение перечисления -
+// это REVOKE, и геттер отдаёт его же для пустого поля, поэтому без неё
+// любое служебное протокольное (раздача ключей истории, сверка состояния)
+// читалось бы как «удалить у всех».
+func protocolOf(msg *waProto.Message, kind waProto.ProtocolMessage_Type) *waProto.ProtocolMessage {
+	if msg == nil {
+		return nil
+	}
+	protocolMsg := msg.GetProtocolMessage()
+	if protocolMsg == nil {
+		protocolMsg = msg.GetEditedMessage().GetMessage().GetProtocolMessage()
+	}
+	if protocolMsg == nil || protocolMsg.Type == nil ||
+		protocolMsg.GetType() != kind || protocolMsg.GetKey().GetID() == "" {
+		return nil
+	}
+	return protocolMsg
+}
+
+// editFromProtocol - правка открытым протокольным сообщением: номер
+// поправленного сообщения и его новое содержимое.
+func editFromProtocol(msg *waProto.Message) (target string, edited *waProto.Message, ok bool) {
+	protocolMsg := protocolOf(msg, waProto.ProtocolMessage_MESSAGE_EDIT)
+	if protocolMsg == nil {
+		return "", nil, false
+	}
+	return protocolMsg.GetKey().GetID(), protocolMsg.GetEditedMessage(), true
+}
+
+// revokeFromProtocol - «удалить у всех». «Удалить у себя» не рассылается
+// вовсе, и сюда не приходит ничего.
+func revokeFromProtocol(msg *waProto.Message) (target string, ok bool) {
+	protocolMsg := protocolOf(msg, waProto.ProtocolMessage_REVOKE)
+	if protocolMsg == nil {
+		return "", false
+	}
+	return protocolMsg.GetKey().GetID(), true
 }
 
 // Имена заполненных полей сообщения: reactionMessage, protocolMessage и т.п.
@@ -1009,6 +1403,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		waMediaType = whatsmeow.MediaAudio
 	case "document":
 		waMediaType = whatsmeow.MediaDocument
+	case "sticker":
+		// Стикеры лежат на CDN под ключами картинок.
+		waMediaType = whatsmeow.MediaImage
 	default:
 		return false, "", "", "", fmt.Errorf("unsupported media type: %s", mediaType)
 	}
@@ -1522,15 +1919,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				// Тем же разбором, что и живые сообщения: своя копия здесь
+				// знала только два текстовых поля, и история приезжала
+				// без подписей к файлам и без нетекстовых типов.
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url, directPath string

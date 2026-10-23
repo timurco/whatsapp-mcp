@@ -441,3 +441,65 @@ func TestReactionsEditsAndDeletionsInStore(t *testing.T) {
 		t.Errorf("after the deletion: content %q, revoked_at valid %v", content, revokedAt.Valid)
 	}
 }
+
+// С какого сообщения просить историю: телефон отдаёт то, что лежит перед
+// названным, и назвать надо самое старое из сохранённых.
+func TestOldestMessageOfChat(t *testing.T) {
+	store, err := NewMessageStoreAt(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("NewMessageStoreAt: %v", err)
+	}
+	defer store.Close()
+
+	chat := "120363027275625969@g.us"
+	other := "123456789@s.whatsapp.net"
+	start := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	for _, c := range []string{chat, other} {
+		if err := store.StoreChat(c, "чат", start); err != nil {
+			t.Fatalf("StoreChat: %v", err)
+		}
+	}
+
+	// Порядок записи нарочно не по времени: край истории ищется запросом,
+	// а не тем, что легло первым.
+	for _, m := range []struct {
+		id       string
+		chat     string
+		offset   time.Duration
+		isFromMe bool
+	}{
+		{"NEW", chat, 48 * time.Hour, false},
+		{"OLD", chat, 0, true},
+		{"MID", chat, 24 * time.Hour, false},
+		{"OTHER", other, -72 * time.Hour, false},
+	} {
+		if err := store.StoreMessage(MessageRecord{
+			ID: m.id, ChatJID: m.chat, Sender: "123456789", Content: m.id,
+			Timestamp: start.Add(m.offset), IsFromMe: m.isFromMe,
+		}); err != nil {
+			t.Fatalf("StoreMessage %s: %v", m.id, err)
+		}
+	}
+
+	oldest, err := store.OldestMessage(chat)
+	if err != nil {
+		t.Fatalf("OldestMessage: %v", err)
+	}
+	if oldest.ID != "OLD" {
+		t.Errorf("oldest id = %q, want OLD", oldest.ID)
+	}
+	if !oldest.Timestamp.Equal(start) {
+		t.Errorf("oldest timestamp = %s, want %s", oldest.Timestamp, start)
+	}
+	if !oldest.IsFromMe {
+		t.Error("isFromMe lost: WhatsApp asks for it with the request")
+	}
+	if oldest.Chat.String() != chat {
+		t.Errorf("chat = %q, want %q", oldest.Chat.String(), chat)
+	}
+
+	// Чат, которого нет: просить историю не от чего, и это видно по ошибке.
+	if _, err := store.OldestMessage("999@s.whatsapp.net"); err != sql.ErrNoRows {
+		t.Errorf("OldestMessage of an unknown chat = %v, want sql.ErrNoRows", err)
+	}
+}

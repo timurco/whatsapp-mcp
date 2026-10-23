@@ -295,6 +295,32 @@ func (store *MessageStore) MarkRevoked(messageID, chatJID string, revokedAt time
 	return affected > 0, err
 }
 
+// OldestMessage - самое старое сохранённое сообщение чата. С него просят
+// у телефона то, что было до него.
+func (store *MessageStore) OldestMessage(chatJID string) (types.MessageInfo, error) {
+	var id string
+	var timestamp time.Time
+	var isFromMe bool
+	err := store.db.QueryRow(
+		`SELECT id, timestamp, is_from_me FROM messages
+		WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1`,
+		chatJID,
+	).Scan(&id, &timestamp, &isFromMe)
+	if err != nil {
+		return types.MessageInfo{}, err
+	}
+
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return types.MessageInfo{}, fmt.Errorf("bad chat jid %q: %v", chatJID, err)
+	}
+	return types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: chat, IsFromMe: isFromMe},
+		ID:            id,
+		Timestamp:     timestamp,
+	}, nil
+}
+
 // Отправленное сообщение целиком, как ушло в whatsmeow. По нему отвечаем на
 // retry receipt: кэш whatsmeow ищет сообщение по паре (чат, id), а чат в
 // квитанции приходит LID-ом, хотя отправляли на номер. Пока связки LID-номер
@@ -1220,6 +1246,15 @@ func messageFields(msg *waProto.Message) string {
 	return strings.Join(names, ",")
 }
 
+// BackfillResponse - ответ на просьбу догрузить историю чата: край истории
+// до запроса и после него.
+type BackfillResponse struct {
+	Success      bool   `json:"success"`
+	Message      string `json:"message"`
+	OldestBefore string `json:"oldest_before,omitempty"`
+	OldestAfter  string `json:"oldest_after,omitempty"`
+}
+
 // DownloadMediaRequest represents the request body for the download media API
 type DownloadMediaRequest struct {
 	MessageID string `json:"message_id"`
@@ -1582,6 +1617,51 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
+	})
+
+	// Телефон держит историю целиком, а при подключении отдаёт только
+	// последнее окно, поэтому старые разговоры в базе выглядят тонкими.
+	// Этот вход просит то, что было раньше, по одному чату за раз.
+	http.HandleFunc("/api/backfill", func(w http.ResponseWriter, r *http.Request) {
+		chatJID := r.URL.Query().Get("chat")
+		if chatJID == "" {
+			http.Error(w, "chat is required", http.StatusBadRequest)
+			return
+		}
+		count := 50
+		if raw := r.URL.Query().Get("count"); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed <= 0 {
+				http.Error(w, "count must be a positive number", http.StatusBadRequest)
+				return
+			}
+			count = parsed
+		}
+
+		before, after, err := requestBackfill(client, messageStore, chatJID, count, 20*time.Second)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(BackfillResponse{Success: false, Message: err.Error()})
+			return
+		}
+
+		response := BackfillResponse{
+			Success:      true,
+			OldestBefore: before.Format(time.RFC3339),
+			OldestAfter:  after.Format(time.RFC3339),
+		}
+		if after.Before(before) {
+			response.Message = fmt.Sprintf("History for %s now starts at %s instead of %s",
+				chatJID, after.Format("2006-01-02 15:04:05"), before.Format("2006-01-02 15:04:05"))
+		} else {
+			// Телефон отвечает молчанием и когда дошёл до начала чата,
+			// и когда он не в сети: отличить одно от другого отсюда нельзя,
+			// и говорить надо именно так.
+			response.Message = fmt.Sprintf("Nothing older than %s arrived: either the chat starts there or the phone is offline",
+				before.Format("2006-01-02 15:04:05"))
+		}
+		json.NewEncoder(w).Encode(response)
 	})
 
 	// Handler for downloading media
@@ -2014,40 +2094,52 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
 }
 
-// Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
-	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
-		return
+// requestBackfill просит у телефона count сообщений, лежащих раньше самого
+// старого сохранённого в этом чате. Ответ приходит обычным history sync
+// и ложится в базу тем же путём, что и всё остальное, поэтому здесь
+// остаётся только дождаться, пока край истории сдвинется.
+func requestBackfill(client *whatsmeow.Client, messageStore *MessageStore, chatJID string, count int, wait time.Duration) (before, after time.Time, err error) {
+	if client == nil || !client.IsConnected() {
+		return before, after, fmt.Errorf("not connected to WhatsApp")
 	}
-
-	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
-		return
-	}
-
 	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
-		return
+		return before, after, fmt.Errorf("not logged in")
+	}
+	if count <= 0 {
+		// Столько за раз советует просить сам whatsmeow.
+		count = 50
 	}
 
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
+	oldest, err := messageStore.OldestMessage(chatJID)
+	if err == sql.ErrNoRows {
+		return before, after, fmt.Errorf("no messages stored for %s yet: nothing to go back from", chatJID)
+	} else if err != nil {
+		return before, after, err
+	}
+	before = oldest.Timestamp
+
+	historyMsg := client.BuildHistorySyncRequest(&oldest, count)
 	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
+		return before, after, fmt.Errorf("failed to build the history request")
+	}
+	if _, err := client.SendPeerMessage(context.Background(), historyMsg); err != nil {
+		return before, after, fmt.Errorf("failed to ask the phone: %v", err)
 	}
 
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
-	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+	// Ждём ответа здесь, а не отвечаем «спросили, зайдите позже»: иначе
+	// звавшему пришлось бы угадывать, когда смотреть, и шаг назад по
+	// истории нельзя было бы повторять в цикле.
+	after = before
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		fresh, err := messageStore.OldestMessage(chatJID)
+		if err == nil && fresh.Timestamp.Before(before) {
+			after = fresh.Timestamp
+			break
+		}
 	}
+	return before, after, nil
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file

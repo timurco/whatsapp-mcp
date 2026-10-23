@@ -14,7 +14,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    request_older_messages as whatsapp_request_older_messages
 )
 
 # Initialize FastMCP server
@@ -261,6 +262,28 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def request_older_messages(chat_jid: str, count: int = 50) -> Dict[str, Any]:
+    """Ask the phone for messages older than the oldest one stored for a chat.
+
+    WhatsApp only sends a recent window of history when the bridge links, so
+    older conversations are thin locally. This asks for the messages right
+    before the oldest stored one and waits for them, so it can be repeated
+    to walk a chat further back.
+
+    Args:
+        chat_jid: The JID of the chat to extend (e.g. "123456789@s.whatsapp.net")
+        count: How many messages to ask for at a time (50 is what WhatsApp expects)
+
+    Returns:
+        A dictionary with success status and where the stored history starts now
+    """
+    success, status_message = whatsapp_request_older_messages(chat_jid, count)
+    return {
+        "success": success,
+        "message": status_message
+    }
 
 if __name__ == "__main__":
     # Initialize and run the server

@@ -908,6 +908,40 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
+def request_older_messages(chat_jid: str, count: int = 50) -> Tuple[bool, str]:
+    """Попросить телефон отдать сообщения старше самого старого сохранённого.
+
+    При подключении WhatsApp присылает только последнее окно истории,
+    поэтому старые разговоры в базе лежат куском. Мост спрашивает телефон
+    и ждёт ответа, так что шаг назад можно повторять, пока история
+    не дойдёт до нужной даты.
+    """
+    try:
+        if not chat_jid:
+            return False, "Chat JID must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/backfill"
+        # Мост ждёт ответа телефона до двадцати секунд, и наше ожидание
+        # должно быть длиннее его, иначе оборвём запрос на середине.
+        response = requests.get(
+            url,
+            params={"chat": chat_jid, "count": count},
+            timeout=(BRIDGE_TIMEOUT[0], 40),
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:
         # Validate input

@@ -40,7 +40,7 @@
     "composerIcon": "./assets/whatsapp-mcp.svg",
     "logo": "./assets/whatsapp-mcp.svg",
     "screenshots": [
-      "./assets/example-use.png"
+      "./example-use.png"
     ]
   }
 }

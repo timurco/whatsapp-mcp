@@ -104,6 +104,46 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+    reply_to: Optional[str] = None
+    reply_sender: Optional[str] = None
+    mentions: Optional[List[str]] = None
+
+# Колонки, которыми читаются сообщения: один список на все запросы, чтобы
+# индексы в разборе строки не разъезжались с SELECT.
+MESSAGE_COLUMNS = (
+    "messages.timestamp, messages.sender, chats.name, messages.content, "
+    "messages.is_from_me, chats.jid, messages.id, messages.media_type, "
+    "messages.reply_to, messages.reply_sender, messages.mentions"
+)
+
+
+def mentions_from_row(raw: Optional[str]) -> Optional[List[str]]:
+    """Упомянутые JID: мост пишет их JSON-массивом, старые строки пусты."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, list) and parsed else None
+
+
+def message_from_row(row) -> "Message":
+    """Собрать Message из строки, выбранной по MESSAGE_COLUMNS."""
+    return Message(
+        timestamp=datetime.fromisoformat(row[0]),
+        sender=row[1],
+        chat_name=row[2],
+        content=row[3],
+        is_from_me=row[4],
+        chat_jid=row[5],
+        id=row[6],
+        media_type=row[7],
+        reply_to=row[8],
+        reply_sender=row[9],
+        mentions=mentions_from_row(row[10]),
+    )
+
 
 @dataclass
 class Chat:
@@ -202,10 +242,25 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
     content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
-    
+
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
-        output += f"From: {sender_name}: {content_prefix}{message.content}\n"
+
+        # Ответ без пометки читается как новая реплика, и в группе непонятно,
+        # кому он адресован.
+        reply_prefix = ""
+        if message.reply_to:
+            if message.reply_sender:
+                reply_prefix = f"[Reply to {get_sender_name(message.reply_sender)} - Message ID: {message.reply_to}] "
+            else:
+                reply_prefix = f"[Reply to Message ID: {message.reply_to}] "
+
+        mentions_suffix = ""
+        if message.mentions:
+            mentioned = ", ".join(get_sender_name(jid) for jid in message.mentions)
+            mentions_suffix = f" [Mentions: {mentioned}]"
+
+        output += f"From: {sender_name}: {reply_prefix}{content_prefix}{message.content}{mentions_suffix}\n"
     except Exception as e:
         print(f"Error formatting message: {e}", file=sys.stderr)
     return output
@@ -238,7 +293,7 @@ def list_messages(
         cursor = conn.cursor()
 
         # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
+        query_parts = [f"SELECT {MESSAGE_COLUMNS} FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
         params = []
@@ -299,17 +354,7 @@ def list_messages(
         
         result = []
         for msg in messages:
-            message = Message(
-                timestamp=datetime.fromisoformat(msg[0]),
-                sender=msg[1],
-                chat_name=msg[2],
-                content=msg[3],
-                is_from_me=msg[4],
-                chat_jid=msg[5],
-                id=msg[6],
-                media_type=msg[7]
-            )
-            result.append(message)
+            result.append(message_from_row(msg))
             
         if include_context and result:
             # Add context for each message
@@ -344,8 +389,8 @@ def get_message_context(
         cursor = conn.cursor()
         
         # Get the target message first
-        cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+        cursor.execute(f"""
+            SELECT {MESSAGE_COLUMNS}
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.id = ?
@@ -355,62 +400,31 @@ def get_message_context(
         if not msg_data:
             raise ValueError(f"Message with ID {message_id} not found")
             
-        target_message = Message(
-            timestamp=datetime.fromisoformat(msg_data[0]),
-            sender=msg_data[1],
-            chat_name=msg_data[2],
-            content=msg_data[3],
-            is_from_me=msg_data[4],
-            chat_jid=msg_data[5],
-            id=msg_data[6],
-            media_type=msg_data[8]
-        )
+        target_message = message_from_row(msg_data)
         
         # Get messages before
-        cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+        cursor.execute(f"""
+            SELECT {MESSAGE_COLUMNS}
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
             ORDER BY messages.timestamp DESC
             LIMIT ?
-        """, (msg_data[7], msg_data[0], before))
+        """, (msg_data[5], msg_data[0], before))
         
-        before_messages = []
-        for msg in cursor.fetchall():
-            before_messages.append(Message(
-                timestamp=datetime.fromisoformat(msg[0]),
-                sender=msg[1],
-                chat_name=msg[2],
-                content=msg[3],
-                is_from_me=msg[4],
-                chat_jid=msg[5],
-                id=msg[6],
-                media_type=msg[7]
-            ))
+        before_messages = [message_from_row(msg) for msg in cursor.fetchall()]
         
         # Get messages after
-        cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+        cursor.execute(f"""
+            SELECT {MESSAGE_COLUMNS}
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
             ORDER BY messages.timestamp ASC
             LIMIT ?
-        """, (msg_data[7], msg_data[0], after))
+        """, (msg_data[5], msg_data[0], after))
         
-        after_messages = []
-        for msg in cursor.fetchall():
-            after_messages.append(Message(
-                timestamp=datetime.fromisoformat(msg[0]),
-                sender=msg[1],
-                chat_name=msg[2],
-                content=msg[3],
-                is_from_me=msg[4],
-                chat_jid=msg[5],
-                id=msg[6],
-                media_type=msg[7]
-            ))
+        after_messages = [message_from_row(msg) for msg in cursor.fetchall()]
         
         return MessageContext(
             message=target_message,

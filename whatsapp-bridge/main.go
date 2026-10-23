@@ -90,6 +90,9 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			reply_to TEXT,
+			reply_sender TEXT,
+			mentions TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -106,12 +109,21 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	// Старая база заведена без direct_path. Колонку добавляем на месте:
-	// без неё скачивание строит ссылку из url и теряет подпись CDN.
-	if _, err := db.Exec("ALTER TABLE messages ADD COLUMN direct_path TEXT"); err != nil &&
-		!strings.Contains(err.Error(), "duplicate column name") {
-		db.Close()
-		return nil, fmt.Errorf("failed to add direct_path column: %v", err)
+	// Старая база заведена без этих колонок, и CREATE TABLE IF NOT EXISTS её
+	// не меняет. Добавляем на месте: без direct_path скачивание строит ссылку
+	// из url и теряет подпись CDN, без reply_to и mentions ответ в группе
+	// неотличим от новой реплики.
+	for _, column := range []string{
+		"direct_path TEXT",
+		"reply_to TEXT",
+		"reply_sender TEXT",
+		"mentions TEXT",
+	} {
+		if _, err := db.Exec("ALTER TABLE messages ADD COLUMN " + column); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column name") {
+			db.Close()
+			return nil, fmt.Errorf("failed to add column %s: %v", column, err)
+		}
 	}
 
 	return &MessageStore{db: db}, nil
@@ -131,19 +143,52 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// MessageRecord - одна строка таблицы messages. Полей много, и часть из них
+// заполняется не всегда, поэтому они передаются по имени, а не позицией.
+type MessageRecord struct {
+	ID            string
+	ChatJID       string
+	Sender        string
+	Content       string
+	Timestamp     time.Time
+	IsFromMe      bool
+	MediaType     string
+	Filename      string
+	URL           string
+	DirectPath    string
+	MediaKey      []byte
+	FileSHA256    []byte
+	FileEncSHA256 []byte
+	FileLength    uint64
+	ReplyTo       string   // id сообщения, на которое отвечает это
+	ReplySender   string   // автор того сообщения: в группе это не владелец чата
+	Mentions      []string // JID, упомянутые через @
+}
+
 // Store a message in the database
-func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url, directPath string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+func (store *MessageStore) StoreMessage(rec MessageRecord) error {
 	// Only store if there's actual content or media
-	if content == "" && mediaType == "" {
+	if rec.Content == "" && rec.MediaType == "" {
 		return nil
+	}
+
+	// Список храним как JSON: читающая сторона получает массив, а не строку,
+	// которую пришлось бы делить по догадке о разделителе.
+	mentions := ""
+	if len(rec.Mentions) > 0 {
+		if raw, err := json.Marshal(rec.Mentions); err == nil {
+			mentions = string(raw)
+		}
 	}
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, direct_path, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, direct_path, media_key, file_sha256, file_enc_sha256, file_length, reply_to, reply_sender, mentions) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.ID, rec.ChatJID, rec.Sender, rec.Content, rec.Timestamp, rec.IsFromMe,
+		rec.MediaType, rec.Filename, rec.URL, rec.DirectPath,
+		rec.MediaKey, rec.FileSHA256, rec.FileEncSHA256, rec.FileLength,
+		rec.ReplyTo, rec.ReplySender, mentions,
 	)
 	return err
 }
@@ -235,6 +280,49 @@ func extractTextContent(msg *waProto.Message) string {
 
 	// For now, we're ignoring non-text messages
 	return ""
+}
+
+// messageContextInfo - ContextInfo сообщения: в нём лежат и цитата, и
+// упоминания. Своё поле contextInfo есть у каждого типа вложения, поэтому
+// ищем его отражением, а не перебором двенадцати геттеров.
+func messageContextInfo(msg *waProto.Message) *waProto.ContextInfo {
+	if msg == nil {
+		return nil
+	}
+
+	var found *waProto.ContextInfo
+	msg.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		if fd.Kind() != protoreflect.MessageKind || fd.IsList() || fd.IsMap() {
+			return true
+		}
+		inner := v.Message()
+		field := inner.Descriptor().Fields().ByName("contextInfo")
+		if field == nil || !inner.Has(field) {
+			return true
+		}
+		ci, ok := inner.Get(field).Message().Interface().(*waProto.ContextInfo)
+		if !ok || ci == nil {
+			return true
+		}
+		found = ci
+		return false
+	})
+	return found
+}
+
+// replyAndMentions - на что это сообщение отвечает и кого упоминает.
+// Участник в ContextInfo приходит и у пересылки, поэтому автор цитаты
+// отдаётся только вместе с id самой цитаты.
+func replyAndMentions(msg *waProto.Message) (replyTo, replySender string, mentions []string) {
+	ci := messageContextInfo(msg)
+	if ci == nil {
+		return "", "", nil
+	}
+	replyTo = ci.GetStanzaID()
+	if replyTo != "" {
+		replySender = ci.GetParticipant()
+	}
+	return replyTo, replySender, ci.GetMentionedJID()
 }
 
 // documentMimeByExt fills gaps in mime.TypeByExtension for common document,
@@ -549,8 +637,26 @@ func storeSentMessage(client *whatsmeow.Client, messageStore *MessageStore, reci
 		content = mediaCaption(msg)
 	}
 
-	err := messageStore.StoreMessage(resp.ID, chat, sender, content, timestamp, true,
-		mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+	replyTo, replySender, mentions := replyAndMentions(msg)
+	err := messageStore.StoreMessage(MessageRecord{
+		ID:            resp.ID,
+		ChatJID:       chat,
+		Sender:        sender,
+		Content:       content,
+		Timestamp:     timestamp,
+		IsFromMe:      true,
+		MediaType:     mediaType,
+		Filename:      filename,
+		URL:           url,
+		DirectPath:    directPath,
+		MediaKey:      mediaKey,
+		FileSHA256:    fileSHA256,
+		FileEncSHA256: fileEncSHA256,
+		FileLength:    fileLength,
+		ReplyTo:       replyTo,
+		ReplySender:   replySender,
+		Mentions:      mentions,
+	})
 	if err != nil {
 		logger.Warnf("Failed to store sent message %s: %v", resp.ID, err)
 		return
@@ -662,23 +768,28 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
+	replyTo, replySender, mentions := replyAndMentions(msg.Message)
+
 	// Store message in database
-	err = messageStore.StoreMessage(
-		msg.Info.ID,
-		chatJID,
-		sender,
-		content,
-		msg.Info.Timestamp,
-		msg.Info.IsFromMe,
-		mediaType,
-		filename,
-		url,
-		directPath,
-		mediaKey,
-		fileSHA256,
-		fileEncSHA256,
-		fileLength,
-	)
+	err = messageStore.StoreMessage(MessageRecord{
+		ID:            msg.Info.ID,
+		ChatJID:       chatJID,
+		Sender:        sender,
+		Content:       content,
+		Timestamp:     msg.Info.Timestamp,
+		IsFromMe:      msg.Info.IsFromMe,
+		MediaType:     mediaType,
+		Filename:      filename,
+		URL:           url,
+		DirectPath:    directPath,
+		MediaKey:      mediaKey,
+		FileSHA256:    fileSHA256,
+		FileEncSHA256: fileEncSHA256,
+		FileLength:    fileLength,
+		ReplyTo:       replyTo,
+		ReplySender:   replySender,
+		Mentions:      mentions,
+	})
 
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
@@ -1470,22 +1581,27 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				err = messageStore.StoreMessage(
-					msgID,
-					chatJID,
-					sender,
-					content,
-					timestamp,
-					isFromMe,
-					mediaType,
-					filename,
-					url,
-					directPath,
-					mediaKey,
-					fileSHA256,
-					fileEncSHA256,
-					fileLength,
-				)
+				replyTo, replySender, mentions := replyAndMentions(msg.Message.Message)
+
+				err = messageStore.StoreMessage(MessageRecord{
+					ID:            msgID,
+					ChatJID:       chatJID,
+					Sender:        sender,
+					Content:       content,
+					Timestamp:     timestamp,
+					IsFromMe:      isFromMe,
+					MediaType:     mediaType,
+					Filename:      filename,
+					URL:           url,
+					DirectPath:    directPath,
+					MediaKey:      mediaKey,
+					FileSHA256:    fileSHA256,
+					FileEncSHA256: fileEncSHA256,
+					FileLength:    fileLength,
+					ReplyTo:       replyTo,
+					ReplySender:   replySender,
+					Mentions:      mentions,
+				})
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {

@@ -800,6 +800,25 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 }
 
 // Function to download media from a message
+// mediaFilePrefix - короткая часть номера сообщения, годная для имени файла.
+func mediaFilePrefix(messageID string) string {
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			return r
+		default:
+			return -1
+		}
+	}, messageID)
+	if len(safe) > 12 {
+		safe = safe[:12]
+	}
+	if safe == "" {
+		safe = "msg"
+	}
+	return safe
+}
+
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
 	var mediaType, filename, url, directPath string
@@ -836,8 +855,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Generate a local path for the file. Имя из extractMediaInfo - это тип и
+	// время с точностью до секунды, а у документа и вовсе имя отправителя:
+	// два фото в одну секунду или два invoice.pdf затирали друг друга, и обе
+	// записи в базе указывали на один файл. Номер сообщения уникален в чате,
+	// поэтому повторное скачивание пишет в тот же файл, а разные - в разные.
+	localPath = fmt.Sprintf("%s/%s_%s", chatDir, mediaFilePrefix(messageID), filename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
